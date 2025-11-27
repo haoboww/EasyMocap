@@ -1,0 +1,18 @@
+ipdb
+joblib
+tqdm
+opencv-python
+yacs
+tabulate
+termcolor
+# git+https://github.com/mattloper/chumpy.git
+mediapipe==0.10.5
+func_timeout
+ultralytics
+gdown
+setuptools==59.5.0
+tensorboard==2.8.0
+pytorch-lightning==1.5.0
+
+#pip install pandas==1.3.5
+#pip install numpy==1.19.5
