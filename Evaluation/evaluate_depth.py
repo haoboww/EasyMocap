@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-SMPL与RealSense深度图评估
-采样200个面向相机的SMPL前表面点，与深度图3D点对比计算误差
+SMPL与RealSense深度图评估 (改进版)
+1. 增加采样点数
+2. 剔除离群点
+3. 计算90%置信区间
 """
 import os
 import sys
@@ -51,7 +53,7 @@ def compute_face_normals(vertices, faces):
     normals = np.cross(v1 - v0, v2 - v0)
     return normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
 
-def select_front_facing_vertices(vertices_cam, smpl_model, num_samples=200):
+def select_front_facing_vertices(vertices_cam, smpl_model, num_samples=2000):
     faces = smpl_model.faces
     face_centers = np.mean(vertices_cam[faces], axis=1)
     face_normals = compute_face_normals(vertices_cam, faces)
@@ -75,13 +77,12 @@ def project_to_image(points_3d, K, dist):
                                       np.zeros(3), np.zeros(3), K, dist)
     return points_2d.reshape(-1, 2)
 
-def read_depth_image(depth_path, depth_scale=0.001):
+def read_depth_image(depth_path, depth_scale=0.0002):
     """
     读取深度图像并转换为米
-    
     Args:
         depth_path: 深度图路径
-        depth_scale: RealSense深度单位
+        depth_scale: RealSense深度单位，默认0.0002 (即0.2mm/count)
     """
     depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     
@@ -106,7 +107,7 @@ def backproject_depth_to_3d(points_2d, depths, K):
     return np.stack([x, y, z], axis=1)
 
 def evaluate_single_frame(frame_idx, smpl_dir, depth_dir, smpl_model, K, R, T, dist, 
-                         num_samples=200, img_width=1280, img_height=720, depth_scale=0.001):
+                         num_samples=1000, img_width=1280, img_height=720, depth_scale=0.0002):
     smpl_path = os.path.join(smpl_dir, f'{frame_idx:06d}.json')
     depth_path = os.path.join(depth_dir, f'{frame_idx:06d}.png')
     
@@ -133,29 +134,56 @@ def evaluate_single_frame(frame_idx, smpl_dir, depth_dir, smpl_model, K, R, T, d
         u_int, v_int = int(round(u)), int(round(v))
         if 0 <= u_int < img_width and 0 <= v_int < img_height:
             depths[i] = depth_map[v_int, u_int]
-            if depths[i] <= 0 or depths[i] > 10.0:
+            if depths[i] <= 0 or depths[i] > 10.0: # 剔除无效深度(<=0)或过远深度(>10m)
                 valid_mask[i] = False
         else:
             valid_mask[i] = False
     
+    if not np.any(valid_mask):
+        return None
+        
     points_3d_depth = backproject_depth_to_3d(points_2d[valid_mask], depths[valid_mask], K)
     errors = np.linalg.norm(points_3d_depth - sampled_vertices[valid_mask], axis=1)
     
+    if len(errors) == 0:
+        return None
+
+    # 离群点剔除：使用IQR方法
+    # Q1 = 25th percentile, Q3 = 75th percentile
+    q1 = np.percentile(errors, 25)
+    q3 = np.percentile(errors, 75)
+    iqr = q3 - q1
+    upper_bound = q3 + 1.5 * iqr
+    # 下界理论上是 q1 - 1.5 * iqr，但误差非负，所以只考虑上界
+    
+    clean_mask = errors <= upper_bound
+    clean_errors = errors[clean_mask]
+    
+    if len(clean_errors) == 0:
+        return None
+        
+    # 计算90%置信区间 (5th to 95th percentile)
+    conf_low = np.percentile(clean_errors, 5)
+    conf_high = np.percentile(clean_errors, 95)
+    
     return {
         'frame_idx': frame_idx,
-        'num_valid': len(errors),
-        'mean_error': np.mean(errors),
-        'std_error': np.std(errors),
-        'median_error': np.median(errors),
-        'max_error': np.max(errors),
-        'min_error': np.min(errors),
-        'errors': errors
+        'num_valid': len(clean_errors),
+        'num_outliers': len(errors) - len(clean_errors),
+        'mean_error': np.mean(clean_errors),
+        'std_error': np.std(clean_errors),
+        'median_error': np.median(clean_errors),
+        'max_error': np.max(clean_errors),
+        'min_error': np.min(clean_errors),
+        'conf_90_low': conf_low,
+        'conf_90_high': conf_high,
+        'errors': clean_errors
     }
 
 def main():
-    root_dir = 'mmWave/EasyMocap'
+    root_dir = '/AmmWave/EasyMocap'
     smpl_dir = os.path.join(root_dir, 'output/detect_triangulate_fitSMPL/smpl')
-    depth_dir = os.path.join(root_dir, 'Eval/depth')
+    depth_dir = os.path.join(root_dir, 'Evaluation/depth')
     intri_path = os.path.join(root_dir, 'data/examples/my_multiview/intri.yml')
     extri_path = os.path.join(root_dir, 'data/examples/my_multiview/extri.yml')
     model_path = os.path.join(root_dir, 'models/pare/data/body_models/smpl/SMPL_NEUTRAL.pkl')
@@ -163,20 +191,19 @@ def main():
     
     os.makedirs(output_dir, exist_ok=True)
     
-    num_samples = 200
+    num_samples = 1000  # 增加采样点数
     img_width = 1280
     img_height = 720
     depth_scale = 0.001
-    
     print("="*70)
-    print("SMPL vs RealSense Depth Evaluation")
+    print("SMPL vs RealSense Depth Evaluation (Enhanced)")
     print("="*70)
     
     print("\nLoading SMPL model...")
     smpl_model = load_smpl_model(model_path)
     
     print("Loading camera parameters (Camera 04)...")
-    K, R, T, dist = load_camera_params(intri_path, extri_path, cam_id='04')
+    K, R, T, dist = load_camera_params(intri_path, extri_path, cam_id='01')
     print(f"Intrinsic matrix K:\n{K}")
     print(f"Samples per frame: {num_samples}")
     print(f"Image size: {img_width} x {img_height}")
@@ -191,8 +218,6 @@ def main():
     matched_frames = sorted(list(set(smpl_frame_ids) & set(depth_frame_ids)))
     
     print(f"\nFound {len(smpl_files)} SMPL frames, {len(depth_files)} depth images")
-    print(f"SMPL range: {min(smpl_frame_ids):06d} - {max(smpl_frame_ids):06d}")
-    print(f"Depth range: {min(depth_frame_ids):06d} - {max(depth_frame_ids):06d}")
     print(f"Matched frames: {len(matched_frames)}")
     print(f"Evaluating {len(matched_frames)} frames...")
     
@@ -207,7 +232,7 @@ def main():
             results.append(result)
     
     print("\n" + "="*70)
-    print("Evaluation Results")
+    print("Evaluation Results (Outliers Removed)")
     print("="*70)
     
     if len(results) == 0:
@@ -217,29 +242,30 @@ def main():
     all_errors = np.concatenate([r['errors'] for r in results])
     mean_errors = [r['mean_error'] for r in results]
     
+    # 计算总体置信区间
+    total_conf_low = np.percentile(all_errors, 5)
+    total_conf_high = np.percentile(all_errors, 95)
+    
     print(f"\nSuccessfully evaluated {len(results)} frames")
-    print(f"\nOverall statistics (all points):")
-    print(f"  Total points:  {len(all_errors)}")
+    print(f"\nOverall statistics (Outliers removed):")
+    print(f"  Total valid points: {len(all_errors)}")
     print(f"  Mean error:    {np.mean(all_errors):.4f} m ({np.mean(all_errors)*1000:.2f} mm)")
     print(f"  Std dev:       {np.std(all_errors):.4f} m ({np.std(all_errors)*1000:.2f} mm)")
     print(f"  Median:        {np.median(all_errors):.4f} m ({np.median(all_errors)*1000:.2f} mm)")
-    print(f"  Max error:     {np.max(all_errors):.4f} m ({np.max(all_errors)*1000:.2f} mm)")
-    print(f"  Min error:     {np.min(all_errors):.4f} m ({np.min(all_errors)*1000:.2f} mm)")
+    print(f"  90% Conf Int:  [{total_conf_low:.4f}, {total_conf_high:.4f}] m")
+    print(f"                 [{total_conf_low*1000:.2f}, {total_conf_high*1000:.2f}] mm")
     
-    print(f"\nPer-frame statistics:")
-    print(f"  Mean of means: {np.mean(mean_errors):.4f} m ({np.mean(mean_errors)*1000:.2f} mm)")
-    print(f"  Std of means:  {np.std(mean_errors):.4f} m ({np.std(mean_errors)*1000:.2f} mm)")
-    
-    output_json = os.path.join(output_dir, 'evaluation_results.json')
+    output_json = os.path.join(output_dir, 'evaluation_results_enhanced.json')
     
     results_json = [{
         'frame_idx': int(r['frame_idx']),
         'num_valid': int(r['num_valid']),
+        'num_outliers': int(r['num_outliers']),
         'mean_error': float(r['mean_error']),
         'std_error': float(r['std_error']),
         'median_error': float(r['median_error']),
-        'max_error': float(r['max_error']),
-        'min_error': float(r['min_error'])
+        'conf_90_low': float(r['conf_90_low']),
+        'conf_90_high': float(r['conf_90_high'])
     } for r in results]
     
     summary = {
@@ -249,8 +275,8 @@ def main():
             'mean_error_m': float(np.mean(all_errors)),
             'std_error_m': float(np.std(all_errors)),
             'median_error_m': float(np.median(all_errors)),
-            'max_error_m': float(np.max(all_errors)),
-            'min_error_m': float(np.min(all_errors))
+            'conf_90_low_m': float(total_conf_low),
+            'conf_90_high_m': float(total_conf_high)
         },
         'per_frame': results_json
     }
@@ -259,29 +285,26 @@ def main():
         json.dump(summary, f, indent=2)
     print(f"\nResults saved to: {output_json}")
     
-    report_path = os.path.join(output_dir, 'evaluation_report.txt')
+    report_path = os.path.join(output_dir, 'evaluation_report_enhanced.txt')
     with open(report_path, 'w') as f:
         f.write("="*70 + "\n")
-        f.write("SMPL vs RealSense Depth Evaluation Report\n")
+        f.write("SMPL vs RealSense Depth Evaluation Report (Enhanced)\n")
         f.write("="*70 + "\n\n")
         f.write(f"Frames evaluated: {len(results)}\n")
-        f.write(f"Total points: {len(all_errors)}\n")
-        f.write(f"Samples per frame: {num_samples}\n\n")
+        f.write(f"Total valid points: {len(all_errors)}\n")
+        f.write(f"Samples per frame: {num_samples}\n")
+        f.write("Method: IQR Outlier Removal + 90% Confidence Interval\n\n")
         f.write("Overall error statistics:\n")
         f.write(f"  Mean error:   {np.mean(all_errors):.4f} m ({np.mean(all_errors)*1000:.2f} mm)\n")
         f.write(f"  Std dev:      {np.std(all_errors):.4f} m ({np.std(all_errors)*1000:.2f} mm)\n")
         f.write(f"  Median:       {np.median(all_errors):.4f} m ({np.median(all_errors)*1000:.2f} mm)\n")
-        f.write(f"  Max error:    {np.max(all_errors):.4f} m ({np.max(all_errors)*1000:.2f} mm)\n")
-        f.write(f"  Min error:    {np.min(all_errors):.4f} m ({np.min(all_errors)*1000:.2f} mm)\n\n")
+        f.write(f"  90% Conf Int: [{total_conf_low:.4f}, {total_conf_high:.4f}] m\n\n")
         f.write("Per-frame statistics (first 10 frames):\n")
         for r in results[:10]:
-            f.write(f"  Frame {r['frame_idx']:06d}: {r['mean_error']:.4f} m ({r['num_valid']} valid points)\n")
-        if len(results) > 10:
-            f.write(f"  ... ({len(results)} frames total)\n")
+            f.write(f"  Frame {r['frame_idx']:06d}: {r['mean_error']:.4f} m (90% CI: [{r['conf_90_low']:.3f}, {r['conf_90_high']:.3f}])\n")
     
     print(f"Report saved to: {report_path}")
     print("\nEvaluation complete.")
 
 if __name__ == '__main__':
     main()
-
