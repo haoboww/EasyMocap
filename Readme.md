@@ -6,13 +6,13 @@
  * @FilePath: /EasyMocapRelease/Readme.md
 -->
 # 校准
-python apps/calibration/detect_chessboard.py data/calib/intri/ --out data/calib/intri/chessboard --pattern 5,3 --grid 0.066
+python apps/calibration/detect_chessboard.py data/calib/intri/ --out data/calib/intri/chessboard --pattern 7,4     --grid 0.08
 
 python3 apps/calibration/calib_intri.py data/calib/intri
 
-python apps/calibration/detect_chessboard.py data/calib/extri/ --out data/calib/extri/chessboard --pattern 5,3 --grid 0.066
+python apps/calibration/detect_chessboard.py data/calib/extri/ --out data/calib/extri/chessboard --pattern 7,4 --grid 0.08
 
-python3 apps/calibration/calib_extri.py data/calib/intri     --intri data/calib/intri/output/intri.yml
+python3 apps/calibration/calib_extri.py data/calib/extri     --intri data/calib/intri/output/intri.yml
 
 emc --data config/datasets/mvimage.yml --exp config/mv1p/detect_triangulate_fitSMPL.yml --root data/examples/my_multiview/ --subs_vis  01 02 03 04
 
