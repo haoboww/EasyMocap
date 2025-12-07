@@ -7,8 +7,6 @@ import threading
 import requests
 from requests.auth import HTTPBasicAuth
 import pyrealsense2 as rs
-import queue
-from collections import deque
 import platform
 
 # 导入配置文件
@@ -86,9 +84,9 @@ class CameraThread(threading.Thread):
         self.ip = ip
         self.url = url
         self.use_hardware_decode = use_hardware_decode
-        self.frame_queue = queue.Queue(maxsize=2)  # 小缓冲减少延迟
         self.latest_frame = None
         self.latest_timestamp = None
+        self.frame_lock = threading.Lock()  # 保护latest_frame的锁
         self.running = True
         self.fps_counter = 0
         self.last_fps_time = time.time()
@@ -173,22 +171,11 @@ class CameraThread(threading.Thread):
                         print(f"  {self.ip}: Lost frame, retrying...")
                         break
                     
-                    # 更新帧数据
+                    # 更新帧数据（使用锁保护）
                     current_time = time.time()
-                    self.latest_frame = frame.copy()
-                    self.latest_timestamp = current_time
-                    
-                    # 更新队列（丢弃旧帧）
-                    while not self.frame_queue.empty():
-                        try:
-                            self.frame_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    
-                    try:
-                        self.frame_queue.put((frame, current_time), block=False)
-                    except queue.Full:
-                        pass  # 丢弃帧
+                    with self.frame_lock:
+                        self.latest_frame = frame.copy()
+                        self.latest_timestamp = current_time
                     
                     # FPS统计
                     self.fps_counter += 1
@@ -216,8 +203,11 @@ class CameraThread(threading.Thread):
                     cap.release()
     
     def get_latest_frame(self):
-        """获取最新帧"""
-        return self.latest_frame, self.latest_timestamp
+        """获取最新帧（线程安全，返回copy）"""
+        with self.frame_lock:
+            if self.latest_frame is not None:
+                return self.latest_frame.copy(), self.latest_timestamp
+            return None, None
     
     def stop(self):
         """停止线程"""

@@ -4,8 +4,6 @@ import time
 from datetime import datetime
 import os
 import threading
-import queue
-from collections import deque
 import platform
 
 # RealSense 支持（可选）
@@ -100,9 +98,9 @@ class CameraThread(threading.Thread):
         self.ip = ip
         self.url = url
         self.use_hardware_decode = use_hardware_decode
-        self.frame_queue = queue.Queue(maxsize=2)  # 小缓冲减少延迟
         self.latest_frame = None
         self.latest_timestamp = None
+        self.frame_lock = threading.Lock()  # 保护latest_frame的锁
         self.running = True
         self.fps_counter = 0
         self.last_fps_time = time.time()
@@ -187,22 +185,11 @@ class CameraThread(threading.Thread):
                         print(f"  {self.ip}: Lost frame, retrying...")
                         break
                     
-                    # 更新帧数据
+                    # 更新帧数据（使用锁保护）
                     current_time = time.time()
-                    self.latest_frame = frame.copy()
-                    self.latest_timestamp = current_time
-                    
-                    # 更新队列（丢弃旧帧）
-                    while not self.frame_queue.empty():
-                        try:
-                            self.frame_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    
-                    try:
-                        self.frame_queue.put((frame, current_time), block=False)
-                    except queue.Full:
-                        pass  # 丢弃帧
+                    with self.frame_lock:
+                        self.latest_frame = frame.copy()
+                        self.latest_timestamp = current_time
                     
                     # FPS统计
                     self.fps_counter += 1
@@ -230,8 +217,11 @@ class CameraThread(threading.Thread):
                     cap.release()
     
     def get_latest_frame(self):
-        """获取最新帧"""
-        return self.latest_frame, self.latest_timestamp
+        """获取最新帧（线程安全，返回copy）"""
+        with self.frame_lock:
+            if self.latest_frame is not None:
+                return self.latest_frame.copy(), self.latest_timestamp
+            return None, None
     
     def stop(self):
         """停止线程"""
@@ -406,6 +396,49 @@ def colorize_depth(depth_image):
     )
     return depth_colormap
 
+
+# 添加到文件开头，用于诊断
+def diagnose_gstreamer():
+    """诊断GStreamer支持情况"""
+    print("\n=== GStreamer诊断 ===")
+    
+    # 1. 检查OpenCV GStreamer支持
+    try:
+        test_pipeline = "videotestsrc ! video/x-raw,format=BGR ! appsink"
+        cap = cv2.VideoCapture(test_pipeline, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            print("✓ OpenCV GStreamer支持: 是")
+            cap.release()
+        else:
+            print("✗ OpenCV GStreamer支持: 否")
+    except Exception as e:
+        print(f"✗ OpenCV GStreamer支持: 错误 - {e}")
+    
+    # 2. 检查NVIDIA插件
+    import subprocess
+    plugins = ["nvh264dec", "nvv4l2decoder", "nvvidconv"]
+    for plugin in plugins:
+        try:
+            result = subprocess.run(
+                ['gst-inspect-1.0', plugin],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                print(f"✓ GStreamer插件 {plugin}: 可用")
+            else:
+                print(f"✗ GStreamer插件 {plugin}: 不可用")
+        except FileNotFoundError:
+            print(f"✗ gst-inspect-1.0 命令未找到（GStreamer未安装）")
+            break
+        except Exception as e:
+            print(f"✗ 检查插件 {plugin} 时出错: {e}")
+    
+    print("==================\n")
+
+# 在main()函数开始处调用
+# diagnose_gstreamer()
+
 def main():
     global recording_started, stop_recording
     
@@ -432,7 +465,11 @@ def main():
     # 测试所有相机连接
     print(f"\nTesting camera connections...")
     available_cameras = {}
-    
+
+    # print(f"\n诊断Diagnosing GStreamer...")
+    # diagnose_gstreamer()
+
+
     for ip in ip_list:
         success, message = test_camera_connection(ip)
         if success:
@@ -542,11 +579,6 @@ def main():
                 time.sleep(0.01)
                 continue
 
-            # 如果只有部分相机工作，仍然继续运行
-            if len(frames) < len(active_threads):
-                active_count = sum(1 for t in active_threads if not t.connection_lost)
-                print(f"Warning: Only {len(frames)}/{active_count} cameras synchronized")
-            
             # 读取 RealSense 帧
             realsense_color = None
             realsense_depth = None
